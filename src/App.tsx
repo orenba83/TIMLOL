@@ -29,7 +29,12 @@ function App() {
   }, [systemAudioAvailable, recorder.sourceMode, recorder.setSourceMode]);
 
   const canStart = !!recorder.apiKey.trim() && recorder.apiKeyValid !== false;
-  const sideMode = recorder.isRecording || !recorder.summary ? 'insights' : 'summary';
+  const sideMode =
+    recorder.isRecording || (!recorder.summary && !recorder.isProcessing)
+      ? 'insights'
+      : recorder.summary || (!recorder.isRecording && recorder.isProcessing)
+        ? 'summary'
+        : 'insights';
 
   return (
     <div

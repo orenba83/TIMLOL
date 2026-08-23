@@ -1,19 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  CHUNK_INTERVAL_MS,
-  FIRST_CHUNK_MS,
   PcmRecorder,
   fileToWavChunks,
   getAudioStream,
 } from '@/lib/audio';
 import {
+  extractLiveInsights,
   summarizeTranscript,
   transcribeAudioChunk,
   validateApiKey,
 } from '@/lib/gemini';
 import type {
   AudioSourceMode,
-  LanguageMode,
+  ChunkSeconds,
+  InsightItem,
   RecordingStatus,
   TaskItem,
 } from '@/lib/types';
@@ -24,12 +24,13 @@ interface UseMeetingRecorderResult {
   apiKeyValid: boolean | null;
   sourceMode: AudioSourceMode;
   setSourceMode: (m: AudioSourceMode) => void;
-  language: LanguageMode;
-  setLanguage: (m: LanguageMode) => void;
+  chunkSeconds: ChunkSeconds;
+  setChunkSeconds: (s: ChunkSeconds) => void;
   isRecording: boolean;
   isProcessing: boolean;
   status: RecordingStatus;
   transcript: string;
+  insights: InsightItem[];
   summary: string;
   tasks: TaskItem[];
   elapsedSeconds: number;
@@ -40,9 +41,11 @@ interface UseMeetingRecorderResult {
   processFile: (file: File) => Promise<void>;
   copyTranscript: () => void;
   copySummary: () => void;
+  copyInsights: () => void;
 }
 
 const RATE_LIMIT_RETRY_MS = 30000;
+const INSIGHTS_EVERY_CHUNKS = 3;
 
 type WakeLockSentinelLike = {
   release: () => Promise<void>;
@@ -55,7 +58,7 @@ export function useMeetingRecorder(
   const [apiKey, setApiKeyState] = useState(initialApiKey);
   const [apiKeyValid, setApiKeyValid] = useState<boolean | null>(null);
   const [sourceMode, setSourceMode] = useState<AudioSourceMode>('mic');
-  const [language, setLanguage] = useState<LanguageMode>('auto');
+  const [chunkSeconds, setChunkSecondsState] = useState<ChunkSeconds>(2);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [status, setStatus] = useState<RecordingStatus>({
@@ -63,6 +66,7 @@ export function useMeetingRecorder(
     message: 'מוכן להתחלה',
   });
   const [transcript, setTranscript] = useState('');
+  const [insights, setInsights] = useState<InsightItem[]>([]);
   const [summary, setSummary] = useState('');
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -81,7 +85,9 @@ export function useMeetingRecorder(
   const processingQueueRef = useRef(false);
   const rateLimitedUntilRef = useRef(0);
   const apiKeyRef = useRef(apiKey);
-  const languageRef = useRef(language);
+  const chunkSecondsRef = useRef<ChunkSeconds>(2);
+  const chunksSinceInsightsRef = useRef(0);
+  const insightsBusyRef = useRef(false);
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
 
   useEffect(() => {
@@ -91,10 +97,6 @@ export function useMeetingRecorder(
   useEffect(() => {
     apiKeyRef.current = apiKey;
   }, [apiKey]);
-
-  useEffect(() => {
-    languageRef.current = language;
-  }, [language]);
 
   const releaseWakeLock = useCallback(async () => {
     const lock = wakeLockRef.current;
@@ -122,7 +124,7 @@ export function useMeetingRecorder(
         if (wakeLockRef.current === lock) wakeLockRef.current = null;
       });
     } catch {
-      /* unsupported or denied — non-fatal */
+      /* unsupported or denied */
     }
   }, []);
 
@@ -174,21 +176,47 @@ export function useMeetingRecorder(
     rafRef.current = requestAnimationFrame(updateAudioLevel);
   }, []);
 
-  const transcribeBase64 = useCallback(async (base64: string) => {
-    const result = await transcribeAudioChunk(
-      apiKeyRef.current,
-      base64,
-      'audio/wav',
-      languageRef.current
-    );
-    if (result.isRealSpeech && result.transcript) {
-      setTranscript((prev) => {
-        const next = prev ? `${prev} ${result.transcript}` : result.transcript;
-        transcriptRef.current = next;
-        return next;
-      });
+  const refreshInsights = useCallback(async () => {
+    if (insightsBusyRef.current || stoppingRef.current) return;
+    const text = transcriptRef.current.trim();
+    if (text.length < 40) return;
+    insightsBusyRef.current = true;
+    try {
+      const res = await extractLiveInsights(apiKeyRef.current, text);
+      if (!stoppingRef.current) {
+        setInsights(res.insights);
+      }
+    } catch (err) {
+      console.error('Insights error:', err);
+    } finally {
+      insightsBusyRef.current = false;
     }
   }, []);
+
+  const transcribeBase64 = useCallback(
+    async (base64: string) => {
+      const result = await transcribeAudioChunk(
+        apiKeyRef.current,
+        base64,
+        'audio/wav'
+      );
+      if (result.isRealSpeech && result.transcript) {
+        setTranscript((prev) => {
+          const next = prev
+            ? `${prev} ${result.transcript}`
+            : result.transcript;
+          transcriptRef.current = next;
+          return next;
+        });
+        chunksSinceInsightsRef.current += 1;
+        if (chunksSinceInsightsRef.current >= INSIGHTS_EVERY_CHUNKS) {
+          chunksSinceInsightsRef.current = 0;
+          void refreshInsights();
+        }
+      }
+    },
+    [refreshInsights]
+  );
 
   const processQueue = useCallback(async () => {
     if (processingQueueRef.current) return;
@@ -254,6 +282,28 @@ export function useMeetingRecorder(
     void processQueue();
   }, [processQueue]);
 
+  const startChunkLoop = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+    const ms = chunkSecondsRef.current * 1000;
+    intervalRef.current = window.setInterval(() => {
+      enqueueCurrentAudio();
+    }, ms);
+  }, [enqueueCurrentAudio]);
+
+  const setChunkSeconds = useCallback(
+    (s: ChunkSeconds) => {
+      setChunkSecondsState(s);
+      chunkSecondsRef.current = s;
+      if (isRecordingRef.current) {
+        startChunkLoop();
+      }
+    },
+    [startChunkLoop]
+  );
+
   const start = useCallback(async () => {
     if (!apiKeyRef.current.trim()) {
       setStatus({ status: 'error', message: 'נא להזין מפתח API תחילה' });
@@ -272,9 +322,11 @@ export function useMeetingRecorder(
       stoppingRef.current = false;
       rateLimitedUntilRef.current = 0;
       queueRef.current = [];
+      chunksSinceInsightsRef.current = 0;
 
       setSummary('');
       setTasks([]);
+      setInsights([]);
 
       isRecordingRef.current = true;
       setIsRecording(true);
@@ -287,14 +339,13 @@ export function useMeetingRecorder(
         setElapsedSeconds((s) => s + 1);
       }, 1000);
 
+      const firstMs = Math.min(1500, chunkSecondsRef.current * 1000);
       firstFlushRef.current = window.setTimeout(() => {
         enqueueCurrentAudio();
         firstFlushRef.current = null;
-      }, FIRST_CHUNK_MS);
+      }, firstMs);
 
-      intervalRef.current = window.setInterval(() => {
-        enqueueCurrentAudio();
-      }, CHUNK_INTERVAL_MS);
+      startChunkLoop();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'שגיאה בהפעלת ההקלטה';
       setStatus({ status: 'error', message: msg });
@@ -306,6 +357,7 @@ export function useMeetingRecorder(
     sourceMode,
     updateAudioLevel,
     enqueueCurrentAudio,
+    startChunkLoop,
     requestWakeLock,
     releaseWakeLock,
   ]);
@@ -370,12 +422,13 @@ export function useMeetingRecorder(
           guard += 1;
         }
 
+        setInsights([]);
+
         if (transcriptRef.current.trim()) {
           setStatus({ status: 'processing', message: 'יוצר סיכום דיון…' });
           const s = await summarizeTranscript(
             apiKeyRef.current,
-            transcriptRef.current,
-            languageRef.current
+            transcriptRef.current
           );
           setSummary(s.summary);
           setTasks(s.tasks);
@@ -395,6 +448,7 @@ export function useMeetingRecorder(
     setTranscript('');
     setSummary('');
     setTasks([]);
+    setInsights([]);
     setElapsedSeconds(0);
     transcriptRef.current = '';
     queueRef.current = [];
@@ -407,6 +461,9 @@ export function useMeetingRecorder(
       return;
     }
     setIsProcessing(true);
+    setInsights([]);
+    setSummary('');
+    setTasks([]);
     setStatus({ status: 'file-processing', message: 'מפענח קובץ שמע…' });
     try {
       const chunks = await fileToWavChunks(file);
@@ -422,8 +479,7 @@ export function useMeetingRecorder(
         const result = await transcribeAudioChunk(
           apiKeyRef.current,
           chunks[i],
-          'audio/wav',
-          languageRef.current
+          'audio/wav'
         );
         if (result.transcript) {
           combined = combined
@@ -435,11 +491,7 @@ export function useMeetingRecorder(
       }
       if (combined) {
         setStatus({ status: 'file-processing', message: 'יוצר סיכום…' });
-        const s = await summarizeTranscript(
-          apiKeyRef.current,
-          combined,
-          languageRef.current
-        );
+        const s = await summarizeTranscript(apiKeyRef.current, combined);
         setSummary(s.summary);
         setTasks(s.tasks);
       }
@@ -482,6 +534,12 @@ export function useMeetingRecorder(
         : '');
     copyToClipboard(text, 'הסיכום');
   }, [summary, tasks, copyToClipboard]);
+  const copyInsights = useCallback(() => {
+    const text = insights
+      .map((i) => `${i.kind === 'conflict' ? '[בירור] ' : ''}${i.text}`)
+      .join('\n');
+    copyToClipboard(text, 'התובנות');
+  }, [insights, copyToClipboard]);
 
   useEffect(() => {
     return () => {
@@ -503,12 +561,13 @@ export function useMeetingRecorder(
     apiKeyValid,
     sourceMode,
     setSourceMode,
-    language,
-    setLanguage,
+    chunkSeconds,
+    setChunkSeconds,
     isRecording,
     isProcessing,
     status,
     transcript,
+    insights,
     summary,
     tasks,
     elapsedSeconds,
@@ -519,5 +578,6 @@ export function useMeetingRecorder(
     processFile,
     copyTranscript,
     copySummary,
+    copyInsights,
   };
 }
