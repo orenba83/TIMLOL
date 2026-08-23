@@ -1,39 +1,77 @@
 import type {
   GeminiTranscriptionResponse,
   GeminiSummaryResponse,
+  LanguageMode,
   TaskItem,
 } from './types';
 
-const TRANSCRIPTION_MODEL = 'gemini-3-flash-preview';
-const SUMMARY_MODEL = 'gemini-3-flash-preview';
+const PRIMARY_MODEL = 'gemini-3-flash-preview';
+const FALLBACK_MODELS = [
+  'gemini-3.5-flash',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+];
 
-const TRANSCRIPTION_PROMPT = `You are a real-time meeting transcription engine specialized in Hebrew and English.
-The audio is a short chunk (a few seconds) from a live meeting.
-Your job:
-1. Transcribe ONLY the speech actually present in this audio chunk.
-2. The meeting may be in Hebrew, English, or mixed (Hebrew with English technical terms). Transcribe exactly as spoken, preserving the original language and any code-switching.
-3. If the audio is silent, contains only noise, or has no clear human speech, return an EMPTY transcript and set isRealSpeech to false.
-4. NEVER invent, guess, or hallucinate text. If you are not certain there is speech, return empty.
-5. Do not add speaker labels, timestamps, or commentary — only the raw transcribed words.
+function languageInstructions(mode: LanguageMode): string {
+  switch (mode) {
+    case 'he':
+      return `The speech is primarily Hebrew (including Israeli Hebrew slang and workplace phrasing).
+Transcribe in Hebrew. Keep English words, product names, and code identifiers exactly as spoken.`;
+    case 'en':
+      return `The speech is primarily English.
+Transcribe in English. Keep Hebrew words or names exactly as spoken if they appear.`;
+    default:
+      return `The meeting may be Hebrew-only, English-only, or mixed in the SAME sentence
+(code-switching: Hebrew discussion with English technical terms, or vice versa).
+Transcribe exactly as spoken. Do not translate. Preserve original script for each word
+(Hebrew letters stay Hebrew, Latin letters stay Latin).`;
+  }
+}
 
-Respond with ONLY a JSON object in this exact format, nothing else:
+function transcriptionPrompt(mode: LanguageMode): string {
+  return `You are a real-time meeting transcription engine for Hebrew and English.
+The audio is a short chunk from a live discussion.
+
+${languageInstructions(mode)}
+
+Rules:
+1. Transcribe ONLY speech that is actually in this chunk.
+2. If silent, noise-only, or no clear human speech: empty transcript and isRealSpeech=false.
+3. NEVER invent or guess words. If unsure there is speech, return empty.
+4. No speaker labels, timestamps, or commentary — raw words only.
+5. Keep punctuation light and natural. Do not "correct" code-switching.
+
+Respond with ONLY this JSON:
 {"transcript": "the transcribed text", "isRealSpeech": true}
-If no speech, respond with: {"transcript": "", "isRealSpeech": false}`;
+If no speech:
+{"transcript": "", "isRealSpeech": false}`;
+}
 
-const SUMMARY_PROMPT = `אתה מומחה לסיכום פגישות ודיונים.
-בהתבסס על התמלול שיופיע להלן (שעשוי להיות בעברית, באנגלית, או משולב), עליך לייצר:
-1. "summary": סיכום תמציתי בעברית של עיקרי ההחלטות ונקודות הדיון (2-4 פסקאות קצרות). הסיכום חייב להיות בעברית תמיד, גם אם התמלול באנגלית. מונחים טכניים באנגלית יישארו בלעזית בתוך הטקסט העברי.
-2. "tasks": מערך של פריטי משימה. לכל משימה: "task" (תיאור המשימה בעברית), "assignee" (האחראי — יופק מתוך השיחה; אם לא הוזכר, השתמש ב"לא צוין"), "dueDate" (תאריך יעד שהוזכר, או "לא צוין" אם לא).
-אם אין פריטי פעולה ברורים, החזר מערך tasks ריק.
+function summaryPrompt(mode: LanguageMode): string {
+  const langLine =
+    mode === 'en'
+      ? 'Write the summary and task descriptions in English. Keep Hebrew names as-is.'
+      : 'כתוב את הסיכום ואת תיאורי המשימות בעברית. מונחים טכניים באנגלית יישארו באנגלית.';
 
-השב אך ורק באובייקט JSON בלבד בפורמט הבא:
+  return `אתה מומחה לסיכום פגישות ודיונים.
+התמלול עשוי להיות בעברית, באנגלית, או משולב באותו משפט.
+${langLine}
+
+הפק:
+1. "summary": סיכום תמציתי של עיקרי ההחלטות ונקודות הדיון (2-4 פסקאות קצרות).
+2. "tasks": מערך משימות. לכל משימה: "task", "assignee" (אם לא הוזכר: "לא צוין"), "dueDate" (אם לא הוזכר: "לא צוין").
+אם אין פעולות ברורות, החזר tasks ריק.
+
+השב רק ב-JSON:
 {"summary": "...", "tasks": [{"task": "...", "assignee": "...", "dueDate": "..."}]}`;
+}
 
-async function callGemini(
+async function callGeminiOnce(
   apiKey: string,
   model: string,
   systemPrompt: string,
-  parts: Array<Record<string, unknown>>
+  parts: Array<Record<string, unknown>>,
+  maxOutputTokens: number
 ): Promise<unknown> {
   const body: Record<string, unknown> = {
     system_instruction: { parts: [{ text: systemPrompt }] },
@@ -41,8 +79,11 @@ async function callGemini(
     generationConfig: {
       temperature: 0.1,
       topP: 0.9,
-      maxOutputTokens: 2048,
+      maxOutputTokens,
       responseMimeType: 'application/json',
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
     },
   };
 
@@ -57,7 +98,9 @@ async function callGemini(
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`Gemini API error ${res.status}: ${text}`);
+    const err = new Error(`Gemini API error ${res.status}: ${text}`);
+    (err as Error & { status?: number }).status = res.status;
+    throw err;
   }
 
   const data = await res.json();
@@ -69,6 +112,44 @@ async function callGemini(
     throw new Error('Gemini returned no candidates');
   }
   return candidate;
+}
+
+let resolvedModel: string | null = null;
+
+async function callGemini(
+  apiKey: string,
+  systemPrompt: string,
+  parts: Array<Record<string, unknown>>,
+  maxOutputTokens = 2048
+): Promise<unknown> {
+  const models = resolvedModel
+    ? [resolvedModel, ...FALLBACK_MODELS.filter((m) => m !== resolvedModel)]
+    : [PRIMARY_MODEL, ...FALLBACK_MODELS];
+
+  let lastError: unknown = null;
+  for (const model of models) {
+    try {
+      const candidate = await callGeminiOnce(
+        apiKey,
+        model,
+        systemPrompt,
+        parts,
+        maxOutputTokens
+      );
+      resolvedModel = model;
+      return candidate;
+    } catch (err) {
+      lastError = err;
+      const status = (err as { status?: number }).status;
+      if (status === 404 || status === 400) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('All Gemini models failed');
 }
 
 function extractText(candidate: unknown): string {
@@ -105,13 +186,14 @@ function tryParseJson(text: string): unknown | null {
 export async function transcribeAudioChunk(
   apiKey: string,
   base64Audio: string,
-  mimeType: string
+  mimeType: string,
+  language: LanguageMode = 'auto'
 ): Promise<GeminiTranscriptionResponse> {
   const candidate = await callGemini(
     apiKey,
-    TRANSCRIPTION_MODEL,
-    TRANSCRIPTION_PROMPT,
-    [audioPart(base64Audio, mimeType)]
+    transcriptionPrompt(language),
+    [audioPart(base64Audio, mimeType)],
+    1024
   );
   const text = extractText(candidate);
   const parsed = tryParseJson(text) as GeminiTranscriptionResponse | null;
@@ -126,16 +208,17 @@ export async function transcribeAudioChunk(
 
 export async function summarizeTranscript(
   apiKey: string,
-  transcript: string
+  transcript: string,
+  language: LanguageMode = 'auto'
 ): Promise<GeminiSummaryResponse> {
   if (!transcript.trim()) {
     return { summary: '', tasks: [] };
   }
   const candidate = await callGemini(
     apiKey,
-    SUMMARY_MODEL,
-    SUMMARY_PROMPT,
-    [{ text: `תמלול:\n${transcript}` }]
+    summaryPrompt(language),
+    [{ text: `תמלול:\n${transcript}` }],
+    4096
   );
   const text = extractText(candidate);
   const parsed = tryParseJson(text) as GeminiSummaryResponse | null;

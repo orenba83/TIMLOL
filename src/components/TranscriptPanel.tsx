@@ -39,13 +39,14 @@ export function TranscriptPanel({
       <div
         ref={scrollRef}
         className="flex-1 overflow-y-auto p-5 text-slate-200 text-sm leading-relaxed whitespace-pre-wrap"
+        style={{ unicodeBidi: 'plaintext' }}
       >
         {transcript ? (
           transcript
         ) : (
           <div className="flex flex-col items-center justify-center h-full text-slate-500 text-center gap-2">
             <FileText className="w-8 h-8 opacity-40" />
-            <p>התמלול יופיע כאן בזמן אמת</p>
+            <p>התמלול יופיע כאן בזמן אמת — עברית, English או שניהם יחד</p>
             {isProcessing && (
               <p className="text-xs text-cyan-400/70">מעבד שמע…</p>
             )}
