@@ -6,10 +6,18 @@
 
 html {
   font-family: 'Heebo', 'Segoe UI', system-ui, sans-serif;
+  -webkit-text-size-adjust: 100%;
 }
 
 body {
   background-color: #020617;
+  margin: 0;
+  min-height: 100dvh;
+  overflow-x: hidden;
+}
+
+#root {
+  min-height: 100dvh;
 }
 
 /* Scrollbar styling */
@@ -28,7 +36,6 @@ body {
   background: rgba(100, 116, 139, 0.8);
 }
 
-/* Smooth fade-in for results */
 @keyframes fadeIn {
   from {
     opacity: 0;
