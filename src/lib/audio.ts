@@ -1,15 +1,13 @@
 import type { AudioSourceMode } from './types';
 
-export const CHUNK_INTERVAL_MS = 15000;
-
-export function getSupportedMimeType(): string {
-  return 'audio/wav';
-}
+export const CHUNK_INTERVAL_MS = 12000;
+export const FILE_CHUNK_SECONDS = 20;
+const MAX_BUFFER_SECONDS = 28;
 
 export async function getAudioStream(
   mode: AudioSourceMode
 ): Promise<MediaStream> {
-  const constraints: MediaStreamConstraints = {
+  const micConstraints: MediaStreamConstraints = {
     audio: {
       echoCancellation: true,
       noiseSuppression: true,
@@ -19,55 +17,58 @@ export async function getAudioStream(
   };
 
   if (mode === 'mic') {
-    return navigator.mediaDevices.getUserMedia(constraints);
+    return navigator.mediaDevices.getUserMedia(micConstraints);
+  }
+
+  const displayStream = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    } as MediaTrackConstraints,
+  });
+
+  const sysAudio = displayStream.getAudioTracks();
+  displayStream.getVideoTracks().forEach((t) => t.stop());
+
+  if (sysAudio.length === 0) {
+    displayStream.getTracks().forEach((t) => t.stop());
+    if (mode === 'system') {
+      throw new Error(
+        'לא נמצא שמע מערכת. בחרו "Chrome Tab" / חלון וסמנו Share audio / שתף צליל.'
+      );
+    }
   }
 
   if (mode === 'system') {
-    const displayStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      } as MediaTrackConstraints,
-    });
-    const audioTracks = displayStream.getAudioTracks();
-    if (audioTracks.length === 0) {
-      displayStream.getTracks().forEach((t) => t.stop());
-      throw new Error(
-        'לא נמצא שמע מערכת. ודאו שבחרת לשתף עם צליל/אודיו בעת שיתוף המסך.'
-      );
-    }
-    const audioOnly = new MediaStream(audioTracks);
-    displayStream.getVideoTracks().forEach((t) => t.stop());
-    return audioOnly;
+    return new MediaStream(sysAudio);
   }
 
-  // both: mic + system
-  const micStream = await navigator.mediaDevices.getUserMedia(constraints);
-  try {
-    const displayStream = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      } as MediaTrackConstraints,
-    });
-    const sysAudio = displayStream.getAudioTracks();
-    if (sysAudio.length === 0) {
-      displayStream.getTracks().forEach((t) => t.stop());
-      return micStream;
-    }
-    const combined = new MediaStream([
-      ...micStream.getAudioTracks(),
-      ...sysAudio,
-    ]);
-    displayStream.getVideoTracks().forEach((t) => t.stop());
-    return combined;
-  } catch {
+  const micStream = await navigator.mediaDevices.getUserMedia(micConstraints);
+  if (sysAudio.length === 0) {
     return micStream;
   }
+  return mixAudioStreams([micStream, new MediaStream(sysAudio)]);
+}
+
+function mixAudioStreams(streams: MediaStream[]): MediaStream {
+  const Ctor =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext })
+      .webkitAudioContext;
+  const ctx = new Ctor();
+  const dest = ctx.createMediaStreamDestination();
+
+  for (const stream of streams) {
+    if (stream.getAudioTracks().length === 0) continue;
+    const src = ctx.createMediaStreamSource(stream);
+    src.connect(dest);
+  }
+
+  const mixed = dest.stream;
+  (mixed as MediaStream & { _mixContext?: AudioContext })._mixContext = ctx;
+  return mixed;
 }
 
 function writeString(view: DataView, offset: number, str: string): void {
@@ -88,7 +89,10 @@ function floatTo16BitPCM(
   }
 }
 
-function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
+export function encodeWav(
+  samples: Float32Array,
+  sampleRate: number
+): ArrayBuffer {
   const numChannels = 1;
   const bitDepth = 16;
   const blockAlign = (numChannels * bitDepth) / 8;
@@ -117,7 +121,7 @@ function encodeWav(samples: Float32Array, sampleRate: number): ArrayBuffer {
   return arrayBuffer;
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
+export function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let binary = '';
   const chunkSize = 0x8000;
@@ -145,8 +149,10 @@ export class PcmRecorder {
   private source: MediaStreamAudioSourceNode;
   private processor: ScriptProcessorNode;
   private silentGain: GainNode;
+  private analyser: AnalyserNode;
   private buffers: Float32Array[] = [];
   private sampleRate: number;
+  private stopped = false;
 
   constructor(stream: MediaStream) {
     const Ctor =
@@ -160,28 +166,39 @@ export class PcmRecorder {
     this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
     this.silentGain = this.audioContext.createGain();
     this.silentGain.gain.value = 0;
+    this.analyser = this.audioContext.createAnalyser();
+    this.analyser.fftSize = 2048;
 
     this.processor.onaudioprocess = (e: AudioProcessingEvent) => {
+      if (this.stopped) return;
       const input = e.inputBuffer.getChannelData(0);
       this.buffers.push(new Float32Array(input));
+      const maxSamples = Math.floor(this.sampleRate * MAX_BUFFER_SECONDS);
+      let total = 0;
+      for (const b of this.buffers) total += b.length;
+      while (total > maxSamples && this.buffers.length > 1) {
+        total -= this.buffers[0].length;
+        this.buffers.shift();
+      }
     };
 
-    // ScriptProcessor requires connection to destination to fire onaudioprocess
-    // Route through a silent gain node to avoid audio feedback
+    this.source.connect(this.analyser);
     this.source.connect(this.processor);
     this.processor.connect(this.silentGain);
     this.silentGain.connect(this.audioContext.destination);
+
+    void this.audioContext.resume();
   }
 
   getAnalyser(): AnalyserNode {
-    const analyser = this.audioContext.createAnalyser();
-    analyser.fftSize = 2048;
-    this.source.connect(analyser);
-    return analyser;
+    return this.analyser;
   }
 
-  getWavBase64(): string {
+  takeWavBase64(): string | null {
+    if (this.buffers.length === 0) return null;
     const samples = mergeFloat32(this.buffers);
+    this.buffers = [];
+    if (samples.length < this.sampleRate * 0.2) return null;
     const wav = encodeWav(samples, this.sampleRate);
     return arrayBufferToBase64(wav);
   }
@@ -190,19 +207,23 @@ export class PcmRecorder {
     return this.buffers.length > 0;
   }
 
-  clear(): void {
-    this.buffers = [];
-  }
-
   stop(): void {
-    this.processor.disconnect();
-    this.silentGain.disconnect();
-    this.source.disconnect();
+    this.stopped = true;
+    try {
+      this.processor.disconnect();
+      this.silentGain.disconnect();
+      this.source.disconnect();
+    } catch {
+      /* already disconnected */
+    }
     this.audioContext.close().catch(() => {});
   }
 }
 
-export async function fileToWavBase64(file: File): Promise<string> {
+export async function fileToWavChunks(
+  file: File,
+  chunkSeconds = FILE_CHUNK_SECONDS
+): Promise<string[]> {
   const arrayBuffer = await file.arrayBuffer();
   const Ctor =
     window.AudioContext ||
@@ -212,8 +233,19 @@ export async function fileToWavBase64(file: File): Promise<string> {
   try {
     const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
     const channelData = audioBuffer.getChannelData(0);
-    const wav = encodeWav(channelData, audioBuffer.sampleRate);
-    return arrayBufferToBase64(wav);
+    const rate = audioBuffer.sampleRate;
+    const frameSize = Math.floor(rate * chunkSeconds);
+    const chunks: string[] = [];
+    for (let start = 0; start < channelData.length; start += frameSize) {
+      const slice = channelData.subarray(
+        start,
+        Math.min(start + frameSize, channelData.length)
+      );
+      if (slice.length < rate * 0.3) continue;
+      const wav = encodeWav(new Float32Array(slice), rate);
+      chunks.push(arrayBufferToBase64(wav));
+    }
+    return chunks;
   } finally {
     ctx.close().catch(() => {});
   }
