@@ -1,10 +1,13 @@
 import type { AudioSourceMode } from './types';
 
-export const CHUNK_INTERVAL_MS = 12000;
+/** How often we slice recorded audio for transcription (lower = snappier live text). */
+export const CHUNK_INTERVAL_MS = 4000;
+/** First flush sooner so text appears quickly after start. */
+export const FIRST_CHUNK_MS = 2000;
 export const FILE_CHUNK_SECONDS = 20;
-const MAX_BUFFER_SECONDS = 28;
+const MAX_BUFFER_SECONDS = 16;
+const MIN_CHUNK_SECONDS = 0.12;
 
-/** Screen/tab capture with system audio — desktop Chrome/Edge mainly. */
 export function isDisplayMediaSupported(): boolean {
   try {
     return (
@@ -246,7 +249,7 @@ export class PcmRecorder {
     if (this.buffers.length === 0) return null;
     const samples = mergeFloat32(this.buffers);
     this.buffers = [];
-    if (samples.length < this.sampleRate * 0.2) return null;
+    if (samples.length < this.sampleRate * MIN_CHUNK_SECONDS) return null;
     const wav = encodeWav(samples, this.sampleRate);
     return arrayBufferToBase64(wav);
   }
