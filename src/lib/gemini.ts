@@ -5,11 +5,12 @@ import type {
   TaskItem,
 } from './types';
 
-const PRIMARY_MODEL = 'gemini-3-flash-preview';
+/** Prefer fastest flash models first for live latency. */
+const PRIMARY_MODEL = 'gemini-2.5-flash';
 const FALLBACK_MODELS = [
-  'gemini-3.5-flash',
-  'gemini-2.5-flash',
   'gemini-2.0-flash',
+  'gemini-3-flash-preview',
+  'gemini-3.5-flash',
 ];
 
 function languageInstructions(mode: LanguageMode): string {
@@ -193,7 +194,7 @@ export async function transcribeAudioChunk(
     apiKey,
     transcriptionPrompt(language),
     [audioPart(base64Audio, mimeType)],
-    1024
+    512
   );
   const text = extractText(candidate);
   const parsed = tryParseJson(text) as GeminiTranscriptionResponse | null;

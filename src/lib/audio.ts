@@ -1,12 +1,12 @@
 import type { AudioSourceMode } from './types';
 
-/** How often we slice recorded audio for transcription (lower = snappier live text). */
-export const CHUNK_INTERVAL_MS = 4000;
-/** First flush sooner so text appears quickly after start. */
-export const FIRST_CHUNK_MS = 2000;
+/** Slice interval — lower = less delay before text appears. */
+export const CHUNK_INTERVAL_MS = 2500;
+/** First slice after start. */
+export const FIRST_CHUNK_MS = 1500;
 export const FILE_CHUNK_SECONDS = 20;
-const MAX_BUFFER_SECONDS = 16;
-const MIN_CHUNK_SECONDS = 0.12;
+const MAX_BUFFER_SECONDS = 12;
+const MIN_CHUNK_SECONDS = 0.1;
 
 export function isDisplayMediaSupported(): boolean {
   try {
