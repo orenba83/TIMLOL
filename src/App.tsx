@@ -4,6 +4,7 @@ import { useMeetingRecorder } from '@/hooks/useMeetingRecorder';
 import { loadApiKey, saveApiKey } from '@/lib/storage';
 import { ApiKeyInput } from '@/components/ApiKeyInput';
 import { SourceSelector } from '@/components/SourceSelector';
+import { LanguageSelector } from '@/components/LanguageSelector';
 import { AudioVisualizer } from '@/components/AudioVisualizer';
 import { RecordingControls } from '@/components/RecordingControls';
 import { TranscriptPanel } from '@/components/TranscriptPanel';
@@ -24,30 +25,27 @@ function App() {
       className="min-h-screen bg-slate-950 text-slate-100"
       style={{ fontFamily: "'Heebo', 'Segoe UI', sans-serif" }}
     >
-      {/* Ambient background */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div className="absolute -top-40 -right-40 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl" />
         <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-emerald-500/5 rounded-full blur-3xl" />
       </div>
 
       <div className="relative max-w-6xl mx-auto px-4 py-8">
-        {/* Header */}
         <header className="mb-8 text-center">
           <div className="inline-flex items-center gap-3 mb-3">
             <div className="flex items-center justify-center w-12 h-12 rounded-2xl bg-gradient-to-br from-cyan-400 to-cyan-600 shadow-lg shadow-cyan-500/30">
               <AudioLines className="w-6 h-6 text-slate-900" />
             </div>
             <h1 className="text-2xl sm:text-3xl font-bold text-slate-100">
-              מערכת תמלול וסיכום דיונים
+              TIMLOL — תמלול וסיכום דיונים
             </h1>
           </div>
           <p className="text-slate-400 text-sm flex items-center justify-center gap-1.5">
             <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-            תמלול חי וסיכום חכם בזמן אמת — מופעל על ידי Google Gemini
+            תמלול חי בעברית, באנגלית או בשילוב — סיכום חכם בזמן אמת
           </p>
         </header>
 
-        {/* Setup card */}
         <section className="mb-6 space-y-4">
           <ApiKeyInput
             apiKey={recorder.apiKey}
@@ -55,19 +53,28 @@ function App() {
             valid={recorder.apiKeyValid}
           />
 
-          <div className="rounded-2xl bg-slate-800/60 border border-slate-700/50 p-5">
-            <h2 className="text-sm font-medium text-slate-300 mb-3">
-              בחירת מקור שמע
-            </h2>
-            <SourceSelector
-              mode={recorder.sourceMode}
-              onChange={recorder.setSourceMode}
+          <div className="rounded-2xl bg-slate-800/60 border border-slate-700/50 p-5 space-y-5">
+            <div>
+              <h2 className="text-sm font-medium text-slate-300 mb-3">
+                בחירת מקור שמע
+              </h2>
+              <SourceSelector
+                mode={recorder.sourceMode}
+                onChange={recorder.setSourceMode}
+                disabled={recorder.isRecording}
+              />
+              <p className="mt-2 text-xs text-slate-500">
+                לשמע מערכת ב-Chrome: בחרו טאב וסמנו Share audio. העלאת קובץ זמינה בכפתור למטה.
+              </p>
+            </div>
+            <LanguageSelector
+              mode={recorder.language}
+              onChange={recorder.setLanguage}
               disabled={recorder.isRecording}
             />
           </div>
         </section>
 
-        {/* Visualizer */}
         <section className="mb-6 rounded-2xl bg-slate-800/40 border border-slate-700/50 p-5">
           <div className="flex items-center justify-between mb-3">
             <span className="text-sm font-medium text-slate-300">
@@ -86,7 +93,6 @@ function App() {
           />
         </section>
 
-        {/* Controls */}
         <section className="mb-6 rounded-2xl bg-slate-800/40 border border-slate-700/50 p-5">
           <RecordingControls
             isRecording={recorder.isRecording}
@@ -101,7 +107,6 @@ function App() {
           />
         </section>
 
-        {/* Results */}
         <section className="grid grid-cols-1 lg:grid-cols-2 gap-4 pb-8">
           <div className="h-[420px]">
             <TranscriptPanel
@@ -121,7 +126,7 @@ function App() {
         </section>
 
         <footer className="text-center text-xs text-slate-600 pb-8">
-          100% חינם · רץ בדפדפן · מותאם לעברית ואנגלית
+          רץ בדפדפן · מפתח Gemini נשמר מקומית · עברית ↔ English
         </footer>
       </div>
     </div>
