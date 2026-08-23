@@ -1,7 +1,8 @@
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { AudioLines, Sparkles } from 'lucide-react';
 import { useMeetingRecorder } from '@/hooks/useMeetingRecorder';
 import { loadApiKey, saveApiKey } from '@/lib/storage';
+import { isDisplayMediaSupported } from '@/lib/audio';
 import { ApiKeyInput } from '@/components/ApiKeyInput';
 import { SourceSelector } from '@/components/SourceSelector';
 import { LanguageSelector } from '@/components/LanguageSelector';
@@ -12,10 +13,20 @@ import { SummaryPanel } from '@/components/SummaryPanel';
 
 function App() {
   const recorder = useMeetingRecorder(loadApiKey());
+  const systemAudioAvailable = useMemo(() => isDisplayMediaSupported(), []);
 
   useEffect(() => {
     saveApiKey(recorder.apiKey);
   }, [recorder.apiKey]);
+
+  useEffect(() => {
+    if (
+      !systemAudioAvailable &&
+      (recorder.sourceMode === 'system' || recorder.sourceMode === 'both')
+    ) {
+      recorder.setSourceMode('mic');
+    }
+  }, [systemAudioAvailable, recorder.sourceMode, recorder.setSourceMode]);
 
   const canStart = !!recorder.apiKey.trim() && recorder.apiKeyValid !== false;
 
@@ -62,9 +73,12 @@ function App() {
                 mode={recorder.sourceMode}
                 onChange={recorder.setSourceMode}
                 disabled={recorder.isRecording}
+                systemAudioAvailable={systemAudioAvailable}
               />
               <p className="mt-2 text-[11px] sm:text-xs text-slate-500 text-center sm:text-right leading-relaxed">
-                לשמע מערכת ב-Chrome: בחרו טאב וסמנו Share audio. העלאת קובץ זמינה בכפתור למטה.
+                {systemAudioAvailable
+                  ? 'לשמע מערכת ב-Chrome במחשב: בחרו טאב וסמנו Share audio. העלאת קובץ זמינה בכפתור למטה.'
+                  : 'במכשיר הזה אין תמיכה בשמע מערכת (שיתוף מסך). השתמשו במיקרופון, או הקליטו את הפגישה והעלו קובץ.'}
               </p>
             </div>
             <LanguageSelector

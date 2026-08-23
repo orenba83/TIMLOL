@@ -4,9 +4,40 @@ export const CHUNK_INTERVAL_MS = 12000;
 export const FILE_CHUNK_SECONDS = 20;
 const MAX_BUFFER_SECONDS = 28;
 
+/** Screen/tab capture with system audio — desktop Chrome/Edge mainly. */
+export function isDisplayMediaSupported(): boolean {
+  try {
+    return (
+      typeof navigator !== 'undefined' &&
+      !!navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getDisplayMedia === 'function'
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function isUserMediaSupported(): boolean {
+  try {
+    return (
+      typeof navigator !== 'undefined' &&
+      !!navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === 'function'
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function getAudioStream(
   mode: AudioSourceMode
 ): Promise<MediaStream> {
+  if (!isUserMediaSupported() && mode === 'mic') {
+    throw new Error(
+      'הדפדפן לא תומך בהקלטת מיקרופון. נסו Chrome/Safari מעודכן, או העלו קובץ שמע.'
+    );
+  }
+
   const micConstraints: MediaStreamConstraints = {
     audio: {
       echoCancellation: true,
@@ -20,14 +51,31 @@ export async function getAudioStream(
     return navigator.mediaDevices.getUserMedia(micConstraints);
   }
 
-  const displayStream = await navigator.mediaDevices.getDisplayMedia({
-    video: true,
-    audio: {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-    } as MediaTrackConstraints,
-  });
+  if (!isDisplayMediaSupported()) {
+    throw new Error(
+      'שמע מערכת לא זמין במכשיר/דפדפן הזה. בטלפון: השתמשו במיקרופון או העלו הקלטה. במחשב: Chrome/Edge עם Share audio.'
+    );
+  }
+
+  let displayStream: MediaStream;
+  try {
+    displayStream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      } as MediaTrackConstraints,
+    });
+  } catch (err) {
+    const name = err instanceof DOMException ? err.name : '';
+    if (name === 'NotAllowedError' || name === 'AbortError') {
+      throw new Error('שיתוף המסך בוטל. נסו שוב וסמנו Share audio.');
+    }
+    throw new Error(
+      'לא ניתן לפתוח שמע מערכת. נסו Chrome במחשב, או מיקרופון / העלאת קובץ.'
+    );
+  }
 
   const sysAudio = displayStream.getAudioTracks();
   displayStream.getVideoTracks().forEach((t) => t.stop());
