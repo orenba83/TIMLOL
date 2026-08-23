@@ -1,4 +1,4 @@
-import { Mic, MonitorSpeaker, Mic2, Upload } from 'lucide-react';
+import { Mic, MonitorSpeaker, Mic2 } from 'lucide-react';
 import type { AudioSourceMode } from '@/lib/types';
 
 interface SourceSelectorProps {
@@ -17,7 +17,7 @@ const OPTIONS: Array<{
   {
     value: 'system',
     label: 'שמע מערכת',
-    desc: 'רמקולים / פגישות אונליין',
+    desc: 'טאב / פגישת זום',
     Icon: MonitorSpeaker,
   },
   {
@@ -51,17 +51,6 @@ export function SourceSelector({ mode, onChange, disabled }: SourceSelectorProps
           </button>
         );
       })}
-      <div
-        className={`flex flex-col items-center gap-1.5 rounded-xl border p-3 text-center ${
-          mode === 'file'
-            ? 'border-cyan-500 bg-cyan-500/10 text-cyan-300'
-            : 'border-slate-700 bg-slate-900/40 text-slate-400'
-        }`}
-      >
-        <Upload className="w-5 h-5" />
-        <span className="text-sm font-medium">קובץ</span>
-        <span className="text-[11px] opacity-70">העלאת MP3/WAV</span>
-      </div>
     </div>
   );
 }

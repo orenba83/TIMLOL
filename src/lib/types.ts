@@ -1,4 +1,6 @@
-export type AudioSourceMode = 'mic' | 'system' | 'both' | 'file';
+export type AudioSourceMode = 'mic' | 'system' | 'both';
+
+export type LanguageMode = 'auto' | 'he' | 'en';
 
 export interface TaskItem {
   task: string;
