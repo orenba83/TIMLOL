@@ -1,11 +1,11 @@
 import type {
   GeminiTranscriptionResponse,
   GeminiSummaryResponse,
-  LanguageMode,
+  GeminiInsightsResponse,
+  InsightItem,
   TaskItem,
 } from './types';
 
-/** Prefer fastest flash models first for live latency. */
 const PRIMARY_MODEL = 'gemini-2.5-flash';
 const FALLBACK_MODELS = [
   'gemini-2.0-flash',
@@ -13,27 +13,15 @@ const FALLBACK_MODELS = [
   'gemini-3.5-flash',
 ];
 
-function languageInstructions(mode: LanguageMode): string {
-  switch (mode) {
-    case 'he':
-      return `The speech is primarily Hebrew (including Israeli Hebrew slang and workplace phrasing).
-Transcribe in Hebrew. Keep English words, product names, and code identifiers exactly as spoken.`;
-    case 'en':
-      return `The speech is primarily English.
-Transcribe in English. Keep Hebrew words or names exactly as spoken if they appear.`;
-    default:
-      return `The meeting may be Hebrew-only, English-only, or mixed in the SAME sentence
-(code-switching: Hebrew discussion with English technical terms, or vice versa).
-Transcribe exactly as spoken. Do not translate. Preserve original script for each word
-(Hebrew letters stay Hebrew, Latin letters stay Latin).`;
-  }
-}
+const LANGUAGE_RULE = `The meeting is only Hebrew and/or English (including code-switching in the same sentence).
+Never treat the audio as another language. Transcribe exactly as spoken.
+Do not translate. Hebrew stays Hebrew, English stays English.`;
 
-function transcriptionPrompt(mode: LanguageMode): string {
-  return `You are a real-time meeting transcription engine for Hebrew and English.
+function transcriptionPrompt(): string {
+  return `You are a real-time meeting transcription engine for Hebrew and English only.
 The audio is a short chunk from a live discussion.
 
-${languageInstructions(mode)}
+${LANGUAGE_RULE}
 
 Rules:
 1. Transcribe ONLY speech that is actually in this chunk.
@@ -48,15 +36,30 @@ If no speech:
 {"transcript": "", "isRealSpeech": false}`;
 }
 
-function summaryPrompt(mode: LanguageMode): string {
-  const langLine =
-    mode === 'en'
-      ? 'Write the summary and task descriptions in English. Keep Hebrew names as-is.'
-      : 'כתוב את הסיכום ואת תיאורי המשימות בעברית. מונחים טכניים באנגלית יישארו באנגלית.';
+function insightsPrompt(): string {
+  return `אתה עוזר חי לדיון מקצועי בעברית ו/או אנגלית.
+קיבלת את התמלול עד עכשיו (לא את כל הדיון).
 
-  return `אתה מומחה לסיכום פגישות ודיונים.
-התמלול עשוי להיות בעברית, באנגלית, או משולב באותו משפט.
-${langLine}
+הפק רשימת תובנות קצרה לשימוש תוך כדי השיחה.
+
+כללים:
+1. insights: 2–6 נקודות קצרות. מה חשוב עכשיו? מה כדאי לחדד?
+2. kind="conflict" רק אם:
+   - שני דוברים סותרים זה את זה, או
+   - מישהו טוען עובדה שנשמעת שגויה / לא עקבית (למשל: "בתקן יש 7 פריטים" כשבדיון או בידע כללי נראה שיש 8).
+   סמן כבירור, לא כפסק דין. אל תמציא קונפליקט אם אין רמז.
+3. kind="insight" לשאר: החלטות מתגבשות, פערי מידע, נקודה מעניינת לדיון.
+4. אם הדיון שגרתי ואין מחלוקת — החזר תובנות רגילות בלבד, בלי conflicts.
+5. כתוב בעברית, מונחים טכניים באנגלית יישארו באנגלית.
+6. אל תסכם את כל הפגישה. זה לא סיכום סיום.
+
+השב רק JSON:
+{"insights":[{"kind":"insight","text":"..."},{"kind":"conflict","text":"..."}]}`;
+}
+
+function summaryPrompt(): string {
+  return `אתה מומחה לסיכום פגישות ודיונים בעברית ו/או אנגלית.
+כתוב את הסיכום ואת תיאורי המשימות בעברית. מונחים טכניים באנגלית יישארו באנגלית.
 
 הפק:
 1. "summary": סיכום תמציתי של עיקרי ההחלטות ונקודות הדיון (2-4 פסקאות קצרות).
@@ -187,12 +190,11 @@ function tryParseJson(text: string): unknown | null {
 export async function transcribeAudioChunk(
   apiKey: string,
   base64Audio: string,
-  mimeType: string,
-  language: LanguageMode = 'auto'
+  mimeType: string
 ): Promise<GeminiTranscriptionResponse> {
   const candidate = await callGemini(
     apiKey,
-    transcriptionPrompt(language),
+    transcriptionPrompt(),
     [audioPart(base64Audio, mimeType)],
     512
   );
@@ -207,17 +209,43 @@ export async function transcribeAudioChunk(
   return { transcript: text.trim(), isRealSpeech: text.trim().length > 0 };
 }
 
+export async function extractLiveInsights(
+  apiKey: string,
+  transcript: string
+): Promise<GeminiInsightsResponse> {
+  if (!transcript.trim()) {
+    return { insights: [] };
+  }
+  const candidate = await callGemini(
+    apiKey,
+    insightsPrompt(),
+    [{ text: `תמלול עד כה:\n${transcript.slice(-8000)}` }],
+    1024
+  );
+  const text = extractText(candidate);
+  const parsed = tryParseJson(text) as GeminiInsightsResponse | null;
+  if (!parsed || !Array.isArray(parsed.insights)) {
+    return { insights: [] };
+  }
+  const insights: InsightItem[] = parsed.insights
+    .filter((i) => i && typeof i.text === 'string' && i.text.trim())
+    .map((i) => ({
+      text: i.text.trim(),
+      kind: i.kind === 'conflict' ? 'conflict' : 'insight',
+    }));
+  return { insights };
+}
+
 export async function summarizeTranscript(
   apiKey: string,
-  transcript: string,
-  language: LanguageMode = 'auto'
+  transcript: string
 ): Promise<GeminiSummaryResponse> {
   if (!transcript.trim()) {
     return { summary: '', tasks: [] };
   }
   const candidate = await callGemini(
     apiKey,
-    summaryPrompt(language),
+    summaryPrompt(),
     [{ text: `תמלול:\n${transcript}` }],
     4096
   );

@@ -5,7 +5,7 @@ import { loadApiKey, saveApiKey } from '@/lib/storage';
 import { isDisplayMediaSupported } from '@/lib/audio';
 import { ApiKeyInput } from '@/components/ApiKeyInput';
 import { SourceSelector } from '@/components/SourceSelector';
-import { LanguageSelector } from '@/components/LanguageSelector';
+import { DelaySlider } from '@/components/DelaySlider';
 import { AudioVisualizer } from '@/components/AudioVisualizer';
 import { RecordingControls } from '@/components/RecordingControls';
 import { TranscriptPanel } from '@/components/TranscriptPanel';
@@ -29,6 +29,7 @@ function App() {
   }, [systemAudioAvailable, recorder.sourceMode, recorder.setSourceMode]);
 
   const canStart = !!recorder.apiKey.trim() && recorder.apiKeyValid !== false;
+  const sideMode = recorder.isRecording || !recorder.summary ? 'insights' : 'summary';
 
   return (
     <div
@@ -53,7 +54,7 @@ function App() {
           </div>
           <p className="text-slate-400 text-xs sm:text-sm flex flex-wrap items-center justify-center gap-1.5 text-center max-w-md mx-auto px-2">
             <Sparkles className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-            <span>תמלול חי בעברית, באנגלית או בשילוב — סיכום חכם בזמן אמת</span>
+            <span>זיהוי אוטומטי עברית / English · תובנות בזמן אמת · סיכום בסיום</span>
           </p>
         </header>
 
@@ -64,7 +65,7 @@ function App() {
             valid={recorder.apiKeyValid}
           />
 
-          <div className="rounded-2xl bg-slate-800/60 border border-slate-700/50 p-3 sm:p-5 space-y-4 sm:space-y-5">
+          <div className="rounded-2xl bg-slate-800/60 border border-slate-700/50 p-3 sm:p-5 space-y-4">
             <div>
               <h2 className="text-sm font-medium text-slate-300 mb-2 sm:mb-3 text-center sm:text-right">
                 בחירת מקור שמע
@@ -81,11 +82,6 @@ function App() {
                   : 'במכשיר הזה אין תמיכה בשמע מערכת (שיתוף מסך). השתמשו במיקרופון, או הקליטו את הפגישה והעלו קובץ.'}
               </p>
             </div>
-            <LanguageSelector
-              mode={recorder.language}
-              onChange={recorder.setLanguage}
-              disabled={recorder.isRecording}
-            />
           </div>
         </section>
 
@@ -107,7 +103,7 @@ function App() {
           />
         </section>
 
-        <section className="mb-4 sm:mb-6 rounded-2xl bg-slate-800/40 border border-slate-700/50 p-3 sm:p-5">
+        <section className="mb-3 sm:mb-4 rounded-2xl bg-slate-800/40 border border-slate-700/50 p-3 sm:p-5">
           <RecordingControls
             isRecording={recorder.isRecording}
             isProcessing={recorder.isProcessing}
@@ -121,6 +117,13 @@ function App() {
           />
         </section>
 
+        <section className="mb-4 sm:mb-6">
+          <DelaySlider
+            seconds={recorder.chunkSeconds}
+            onChange={recorder.setChunkSeconds}
+          />
+        </section>
+
         <section className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4 pb-4">
           <div className="h-[min(52vh,380px)] sm:h-[420px]">
             <TranscriptPanel
@@ -131,16 +134,22 @@ function App() {
           </div>
           <div className="h-[min(52vh,380px)] sm:h-[420px]">
             <SummaryPanel
+              mode={sideMode}
+              insights={recorder.insights}
               summary={recorder.summary}
               tasks={recorder.tasks}
-              onCopy={recorder.copySummary}
-              isProcessing={recorder.isProcessing && !recorder.isRecording}
+              onCopy={
+                sideMode === 'summary'
+                  ? recorder.copySummary
+                  : recorder.copyInsights
+              }
+              isProcessing={recorder.isProcessing}
             />
           </div>
         </section>
 
         <footer className="text-center text-[11px] sm:text-xs text-slate-600 pb-4 px-2">
-          רץ בדפדפן · מפתח Gemini נשמר מקומית · עברית ↔ English
+          רץ בדפדפן · מפתח Gemini נשמר מקומית · עברית / English אוטומטי
         </footer>
       </div>
     </div>
