@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CHUNK_INTERVAL_MS,
   PcmRecorder,
-  fileToWavBase64,
+  fileToWavChunks,
   getAudioStream,
 } from '@/lib/audio';
 import {
@@ -13,6 +13,7 @@ import {
 import type {
   AudioSourceMode,
   GeminiSummaryResponse,
+  LanguageMode,
   RecordingStatus,
   TaskItem,
 } from '@/lib/types';
@@ -23,6 +24,8 @@ interface UseMeetingRecorderResult {
   apiKeyValid: boolean | null;
   sourceMode: AudioSourceMode;
   setSourceMode: (m: AudioSourceMode) => void;
+  language: LanguageMode;
+  setLanguage: (m: LanguageMode) => void;
   isRecording: boolean;
   isProcessing: boolean;
   status: RecordingStatus;
@@ -48,6 +51,7 @@ export function useMeetingRecorder(
   const [apiKey, setApiKeyState] = useState(initialApiKey);
   const [apiKeyValid, setApiKeyValid] = useState<boolean | null>(null);
   const [sourceMode, setSourceMode] = useState<AudioSourceMode>('mic');
+  const [language, setLanguage] = useState<LanguageMode>('auto');
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [status, setStatus] = useState<RecordingStatus>({
@@ -71,10 +75,20 @@ export function useMeetingRecorder(
   const stoppingRef = useRef(false);
   const flushingRef = useRef(false);
   const rateLimitedUntilRef = useRef(0);
+  const apiKeyRef = useRef(apiKey);
+  const languageRef = useRef(language);
 
   useEffect(() => {
     transcriptRef.current = transcript;
   }, [transcript]);
+
+  useEffect(() => {
+    apiKeyRef.current = apiKey;
+  }, [apiKey]);
+
+  useEffect(() => {
+    languageRef.current = language;
+  }, [language]);
 
   const setApiKey = useCallback((key: string) => {
     setApiKeyState(key);
@@ -97,12 +111,7 @@ export function useMeetingRecorder(
   const updateAudioLevel = useCallback(() => {
     const recorder = pcmRecorderRef.current;
     if (!recorder) return;
-    const analyser = (recorder as unknown as { _analyser?: AnalyserNode })._analyser;
-    if (!analyser) {
-      setAudioLevel(0);
-      rafRef.current = requestAnimationFrame(updateAudioLevel);
-      return;
-    }
+    const analyser = recorder.getAnalyser();
     const data = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteTimeDomainData(data);
     let sum = 0;
@@ -115,8 +124,93 @@ export function useMeetingRecorder(
     rafRef.current = requestAnimationFrame(updateAudioLevel);
   }, []);
 
+  const runSummary = useCallback(async (text: string) => {
+    if (!text || summarizingRef.current) return;
+    summarizingRef.current = true;
+    try {
+      const s: GeminiSummaryResponse = await summarizeTranscript(
+        apiKeyRef.current,
+        text,
+        languageRef.current
+      );
+      setSummary(s.summary);
+      setTasks(s.tasks);
+    } catch (err) {
+      console.error('Summary error:', err);
+    } finally {
+      summarizingRef.current = false;
+    }
+  }, []);
+
+  const transcribeBase64 = useCallback(async (base64: string) => {
+    const result = await transcribeAudioChunk(
+      apiKeyRef.current,
+      base64,
+      'audio/wav',
+      languageRef.current
+    );
+    if (result.isRealSpeech && result.transcript) {
+      setTranscript((prev) => {
+        const next = prev ? `${prev} ${result.transcript}` : result.transcript;
+        transcriptRef.current = next;
+        return next;
+      });
+      chunksSinceSummaryRef.current += 1;
+    }
+    if (
+      chunksSinceSummaryRef.current >= MAX_CHUNKS_PER_SUMMARY &&
+      !summarizingRef.current
+    ) {
+      chunksSinceSummaryRef.current = 0;
+      void runSummary(transcriptRef.current);
+    }
+  }, [runSummary]);
+
+  const flushChunks = useCallback(async (): Promise<void> => {
+    const recorder = pcmRecorderRef.current;
+    if (!recorder || !recorder.hasAudio()) return;
+    if (flushingRef.current) return;
+
+    const now = Date.now();
+    if (now < rateLimitedUntilRef.current) {
+      const waitSec = Math.ceil((rateLimitedUntilRef.current - now) / 1000);
+      setStatus({
+        status: 'recording',
+        message: `ממתין לאיפוס מכסה (${waitSec}ש)…`,
+      });
+      return;
+    }
+
+    flushingRef.current = true;
+    setIsProcessing(true);
+    setStatus({ status: 'processing', message: 'מעבד שמע…' });
+
+    try {
+      const base64 = recorder.takeWavBase64();
+      if (!base64) return;
+      await transcribeBase64(base64);
+      if (!stoppingRef.current) {
+        setStatus({ status: 'recording', message: 'מקליט' });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'שגיאה לא ידועה';
+      if (msg.includes('429')) {
+        rateLimitedUntilRef.current = Date.now() + RATE_LIMIT_RETRY_MS;
+        setStatus({
+          status: 'recording',
+          message: 'הגעת למכסה הרגעית. ממתין 30 שניות וממשיך…',
+        });
+      } else {
+        setStatus({ status: 'error', message: msg });
+      }
+    } finally {
+      setIsProcessing(false);
+      flushingRef.current = false;
+    }
+  }, [transcribeBase64]);
+
   const start = useCallback(async () => {
-    if (!apiKey.trim()) {
+    if (!apiKeyRef.current.trim()) {
       setStatus({ status: 'error', message: 'נא להזין מפתח API תחילה' });
       return;
     }
@@ -125,8 +219,6 @@ export function useMeetingRecorder(
       streamRef.current = stream;
 
       const recorder = new PcmRecorder(stream);
-      const analyser = recorder.getAnalyser();
-      (recorder as unknown as { _analyser?: AnalyserNode })._analyser = analyser;
       pcmRecorderRef.current = recorder;
 
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -152,89 +244,9 @@ export function useMeetingRecorder(
       setStatus({ status: 'error', message: msg });
       setIsRecording(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiKey, sourceMode, updateAudioLevel]);
+  }, [sourceMode, updateAudioLevel, flushChunks]);
 
-  const flushChunks = useCallback(async (): Promise<void> => {
-    const recorder = pcmRecorderRef.current;
-    if (!recorder || !recorder.hasAudio()) return;
-    if (flushingRef.current) return;
-
-    const now = Date.now();
-    if (now < rateLimitedUntilRef.current) {
-      const waitSec = Math.ceil((rateLimitedUntilRef.current - now) / 1000);
-      setStatus({
-        status: 'recording',
-        message: `ממתין לאיפוס מכסה (${waitSec}ש)…`,
-      });
-      return;
-    }
-
-    flushingRef.current = true;
-    setIsProcessing(true);
-    setStatus({ status: 'processing', message: 'מעבד שמע…' });
-
-    try {
-      const base64 = recorder.getWavBase64();
-      recorder.clear();
-      const result = await transcribeAudioChunk(apiKey, base64, 'audio/wav');
-
-      if (result.isRealSpeech && result.transcript) {
-        setTranscript((prev) => {
-          const addition = result.transcript;
-          const next = prev ? prev + ' ' + addition : addition;
-          transcriptRef.current = next;
-          return next;
-        });
-        chunksSinceSummaryRef.current += 1;
-      }
-
-      if (
-        chunksSinceSummaryRef.current >= MAX_CHUNKS_PER_SUMMARY &&
-        !summarizingRef.current
-      ) {
-        chunksSinceSummaryRef.current = 0;
-        summarizingRef.current = true;
-        const currentTranscript = transcriptRef.current;
-        if (currentTranscript) {
-          summarizeTranscript(apiKey, currentTranscript)
-            .then((s: GeminiSummaryResponse) => {
-              setSummary(s.summary);
-              setTasks(s.tasks);
-            })
-            .catch((err: unknown) => {
-              console.error('Summary error:', err);
-            })
-            .finally(() => {
-              summarizingRef.current = false;
-            });
-        } else {
-          summarizingRef.current = false;
-        }
-      }
-
-      if (!stoppingRef.current) {
-        setStatus({ status: 'recording', message: 'מקליט' });
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'שגיאה לא ידועה';
-      if (msg.includes('429')) {
-        rateLimitedUntilRef.current = Date.now() + RATE_LIMIT_RETRY_MS;
-        setStatus({
-          status: 'recording',
-          message: 'הגעת למכסה הרגעית. ממתין 30 שניות וממשיך…',
-        });
-      } else {
-        setStatus({ status: 'error', message: msg });
-      }
-    } finally {
-      setIsProcessing(false);
-      flushingRef.current = false;
-    }
-  }, [apiKey]);
-
-  const stop = useCallback(() => {
-    stoppingRef.current = true;
+  const teardownCapture = useCallback(() => {
     if (intervalRef.current) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
@@ -247,33 +259,48 @@ export function useMeetingRecorder(
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     }
+    setAudioLevel(0);
+    setIsRecording(false);
+  }, []);
+
+  const stop = useCallback(() => {
+    stoppingRef.current = true;
+    teardownCapture();
+
+    const leftover = pcmRecorderRef.current?.takeWavBase64() ?? null;
     if (pcmRecorderRef.current) {
       pcmRecorderRef.current.stop();
       pcmRecorderRef.current = null;
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
+      const mixCtx = (
+        streamRef.current as MediaStream & { _mixContext?: AudioContext }
+      )._mixContext;
+      mixCtx?.close().catch(() => {});
       streamRef.current = null;
     }
-    setAudioLevel(0);
-    setIsRecording(false);
-    setStatus({ status: 'idle', message: 'ההקלטה הופסקה' });
 
-    flushChunks()
-      .then(() => {
-        const current = transcriptRef.current;
-        if (current) {
-          return summarizeTranscript(apiKey, current).then((s) => {
-            setSummary(s.summary);
-            setTasks(s.tasks);
-          });
+    setStatus({ status: 'processing', message: 'מעבד את סוף ההקלטה…' });
+    setIsProcessing(true);
+
+    (async () => {
+      try {
+        if (leftover) {
+          await transcribeBase64(leftover);
         }
-      })
-      .catch(() => {})
-      .finally(() => {
+        if (transcriptRef.current) {
+          await runSummary(transcriptRef.current);
+        }
+        setStatus({ status: 'idle', message: 'ההקלטה הופסקה' });
+      } catch {
+        setStatus({ status: 'idle', message: 'ההקלטה הופסקה' });
+      } finally {
+        setIsProcessing(false);
         stoppingRef.current = false;
-      });
-  }, [apiKey, flushChunks]);
+      }
+    })();
+  }, [teardownCapture, transcribeBase64, runSummary]);
 
   const reset = useCallback(() => {
     if (isRecording) stop();
@@ -286,37 +313,56 @@ export function useMeetingRecorder(
     setStatus({ status: 'idle', message: 'מוכן להתחלה' });
   }, [isRecording, stop]);
 
-  const processFile = useCallback(
-    async (file: File) => {
-      if (!apiKey.trim()) {
-        setStatus({ status: 'error', message: 'נא להזין מפתח API תחילה' });
-        return;
+  const processFile = useCallback(async (file: File) => {
+    if (!apiKeyRef.current.trim()) {
+      setStatus({ status: 'error', message: 'נא להזין מפתח API תחילה' });
+      return;
+    }
+    setIsProcessing(true);
+    setStatus({ status: 'file-processing', message: 'מפענח קובץ שמע…' });
+    try {
+      const chunks = await fileToWavChunks(file);
+      if (chunks.length === 0) {
+        throw new Error('לא הצלחנו לפענח שמע מהקובץ');
       }
-      setIsProcessing(true);
-      setStatus({ status: 'file-processing', message: 'מעבד קובץ שמע…' });
-      try {
-        const base64 = await fileToWavBase64(file);
-        const result = await transcribeAudioChunk(apiKey, base64, 'audio/wav');
+      let combined = '';
+      for (let i = 0; i < chunks.length; i++) {
+        setStatus({
+          status: 'file-processing',
+          message: `מתמלל קובץ… ${i + 1}/${chunks.length}`,
+        });
+        const result = await transcribeAudioChunk(
+          apiKeyRef.current,
+          chunks[i],
+          'audio/wav',
+          languageRef.current
+        );
         if (result.transcript) {
-          setTranscript(result.transcript);
-          transcriptRef.current = result.transcript;
+          combined = combined
+            ? `${combined} ${result.transcript}`
+            : result.transcript;
+          setTranscript(combined);
+          transcriptRef.current = combined;
         }
+      }
+      if (combined) {
+        setStatus({ status: 'file-processing', message: 'יוצר סיכום…' });
         const s = await summarizeTranscript(
-          apiKey,
-          transcriptRef.current || result.transcript
+          apiKeyRef.current,
+          combined,
+          languageRef.current
         );
         setSummary(s.summary);
         setTasks(s.tasks);
-        setStatus({ status: 'idle', message: 'הקובץ עובד בהצלחה' });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'שגיאה בעיבוד הקובץ';
-        setStatus({ status: 'error', message: msg });
-      } finally {
-        setIsProcessing(false);
       }
-    },
-    [apiKey]
-  );
+      setStatus({ status: 'idle', message: 'הקובץ עובד בהצלחה' });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'שגיאה בעיבוד הקובץ';
+      setStatus({ status: 'error', message: msg });
+    } finally {
+      setIsProcessing(false);
+    }
+  }, []);
 
   const copyToClipboard = useCallback((text: string, label: string) => {
     if (!text) return;
@@ -367,6 +413,8 @@ export function useMeetingRecorder(
     apiKeyValid,
     sourceMode,
     setSourceMode,
+    language,
+    setLanguage,
     isRecording,
     isProcessing,
     status,
