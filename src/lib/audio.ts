@@ -1,12 +1,17 @@
 import type { AudioSourceMode } from './types';
 
-/** Slice interval — lower = less delay before text appears. */
-export const CHUNK_INTERVAL_MS = 2500;
-/** First slice after start. */
-export const FIRST_CHUNK_MS = 1500;
 export const FILE_CHUNK_SECONDS = 20;
-const MAX_BUFFER_SECONDS = 12;
-const MIN_CHUNK_SECONDS = 0.1;
+
+/** After this much silence following speech → send segment (live feel). */
+const SILENCE_FLUSH_MS = 380;
+/** Never hold continuous speech longer than this before sending. */
+const MAX_UTTERANCE_MS = 2000;
+/** Ignore tiny blips. */
+const MIN_SPEECH_MS = 280;
+const MAX_BUFFER_SECONDS = 10;
+const MIN_SAMPLES_SEC = 0.2;
+/** Absolute RMS floor for speech (also compared to noise floor). */
+const SPEECH_RMS = 0.012;
 
 export function isDisplayMediaSupported(): boolean {
   try {
@@ -195,6 +200,22 @@ function mergeFloat32(buffers: Float32Array[]): Float32Array {
   return result;
 }
 
+function rmsOf(input: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < input.length; i++) {
+    const v = input[i];
+    sum += v * v;
+  }
+  return Math.sqrt(sum / Math.max(1, input.length));
+}
+
+export type SegmentHandler = (base64Wav: string) => void;
+
+/**
+ * Continuous PCM capture with automatic segmenting:
+ * flush after a short pause in speech, or after max utterance length.
+ * No manual delay slider — segments follow natural speech rhythm.
+ */
 export class PcmRecorder {
   private audioContext: AudioContext;
   private source: MediaStreamAudioSourceNode;
@@ -204,8 +225,14 @@ export class PcmRecorder {
   private buffers: Float32Array[] = [];
   private sampleRate: number;
   private stopped = false;
+  private onSegment: SegmentHandler | null;
+  private speechMs = 0;
+  private silenceMs = 0;
+  private inSpeech = false;
+  private noiseFloor = 0.004;
 
-  constructor(stream: MediaStream) {
+  constructor(stream: MediaStream, onSegment?: SegmentHandler) {
+    this.onSegment = onSegment ?? null;
     const Ctor =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext })
@@ -214,7 +241,7 @@ export class PcmRecorder {
     this.sampleRate = this.audioContext.sampleRate;
 
     this.source = this.audioContext.createMediaStreamSource(stream);
-    this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
+    this.processor = this.audioContext.createScriptProcessor(2048, 1, 1);
     this.silentGain = this.audioContext.createGain();
     this.silentGain.gain.value = 0;
     this.analyser = this.audioContext.createAnalyser();
@@ -223,13 +250,38 @@ export class PcmRecorder {
     this.processor.onaudioprocess = (e: AudioProcessingEvent) => {
       if (this.stopped) return;
       const input = e.inputBuffer.getChannelData(0);
-      this.buffers.push(new Float32Array(input));
+      const frame = new Float32Array(input);
+      this.buffers.push(frame);
+
       const maxSamples = Math.floor(this.sampleRate * MAX_BUFFER_SECONDS);
       let total = 0;
       for (const b of this.buffers) total += b.length;
       while (total > maxSamples && this.buffers.length > 1) {
         total -= this.buffers[0].length;
         this.buffers.shift();
+      }
+
+      const rms = rmsOf(frame);
+      const frameMs = (frame.length / this.sampleRate) * 1000;
+      this.noiseFloor = this.noiseFloor * 0.97 + rms * 0.03;
+      const threshold = Math.max(SPEECH_RMS, this.noiseFloor * 2.8);
+      const isSpeech = rms >= threshold;
+
+      if (isSpeech) {
+        this.inSpeech = true;
+        this.speechMs += frameMs;
+        this.silenceMs = 0;
+        if (this.speechMs >= MAX_UTTERANCE_MS) {
+          this.emitSegment();
+        }
+      } else if (this.inSpeech) {
+        this.silenceMs += frameMs;
+        if (
+          this.silenceMs >= SILENCE_FLUSH_MS &&
+          this.speechMs >= MIN_SPEECH_MS
+        ) {
+          this.emitSegment();
+        }
       }
     };
 
@@ -241,6 +293,16 @@ export class PcmRecorder {
     void this.audioContext.resume();
   }
 
+  private emitSegment(): void {
+    const base64 = this.takeWavBase64();
+    this.speechMs = 0;
+    this.silenceMs = 0;
+    this.inSpeech = false;
+    if (base64 && this.onSegment) {
+      this.onSegment(base64);
+    }
+  }
+
   getAnalyser(): AnalyserNode {
     return this.analyser;
   }
@@ -249,7 +311,7 @@ export class PcmRecorder {
     if (this.buffers.length === 0) return null;
     const samples = mergeFloat32(this.buffers);
     this.buffers = [];
-    if (samples.length < this.sampleRate * MIN_CHUNK_SECONDS) return null;
+    if (samples.length < this.sampleRate * MIN_SAMPLES_SEC) return null;
     const wav = encodeWav(samples, this.sampleRate);
     return arrayBufferToBase64(wav);
   }

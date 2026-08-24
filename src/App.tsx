@@ -5,7 +5,6 @@ import { loadApiKey, saveApiKey } from '@/lib/storage';
 import { isDisplayMediaSupported } from '@/lib/audio';
 import { ApiKeyInput } from '@/components/ApiKeyInput';
 import { SourceSelector } from '@/components/SourceSelector';
-import { DelaySlider } from '@/components/DelaySlider';
 import { AudioVisualizer } from '@/components/AudioVisualizer';
 import { RecordingControls } from '@/components/RecordingControls';
 import { TranscriptPanel } from '@/components/TranscriptPanel';
@@ -59,7 +58,7 @@ function App() {
           </div>
           <p className="text-slate-400 text-xs sm:text-sm flex flex-wrap items-center justify-center gap-1.5 text-center max-w-md mx-auto px-2">
             <Sparkles className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-            <span>זיהוי אוטומטי עברית / English · תובנות בזמן אמת · סיכום בסיום</span>
+            <span>תמלול חי אוטומטי · עברית / English · תובנות תוך כדי · סיכום בסיום</span>
           </p>
         </header>
 
@@ -108,7 +107,7 @@ function App() {
           />
         </section>
 
-        <section className="mb-3 sm:mb-4 rounded-2xl bg-slate-800/40 border border-slate-700/50 p-3 sm:p-5">
+        <section className="mb-4 sm:mb-6 rounded-2xl bg-slate-800/40 border border-slate-700/50 p-3 sm:p-5">
           <RecordingControls
             isRecording={recorder.isRecording}
             isProcessing={recorder.isProcessing}
@@ -119,13 +118,6 @@ function App() {
             onReset={recorder.reset}
             onFile={recorder.processFile}
             disabled={!canStart}
-          />
-        </section>
-
-        <section className="mb-4 sm:mb-6">
-          <DelaySlider
-            seconds={recorder.chunkSeconds}
-            onChange={recorder.setChunkSeconds}
           />
         </section>
 
@@ -154,7 +146,7 @@ function App() {
         </section>
 
         <footer className="text-center text-[11px] sm:text-xs text-slate-600 pb-4 px-2">
-          רץ בדפדפן · מפתח Gemini נשמר מקומית · עברית / English אוטומטי
+          רץ בדפדפן · מפתח Gemini נשמר מקומית · תמלול חי אוטומטי
         </footer>
       </div>
     </div>

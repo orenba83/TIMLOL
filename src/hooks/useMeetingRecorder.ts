@@ -12,7 +12,6 @@ import {
 } from '@/lib/gemini';
 import type {
   AudioSourceMode,
-  ChunkSeconds,
   InsightItem,
   RecordingStatus,
   TaskItem,
@@ -24,8 +23,6 @@ interface UseMeetingRecorderResult {
   apiKeyValid: boolean | null;
   sourceMode: AudioSourceMode;
   setSourceMode: (m: AudioSourceMode) => void;
-  chunkSeconds: ChunkSeconds;
-  setChunkSeconds: (s: ChunkSeconds) => void;
   isRecording: boolean;
   isProcessing: boolean;
   status: RecordingStatus;
@@ -45,12 +42,17 @@ interface UseMeetingRecorderResult {
 }
 
 const RATE_LIMIT_RETRY_MS = 30000;
-const INSIGHTS_EVERY_CHUNKS = 3;
+/** Parallel Gemini transcription workers — keeps text flowing while API responds. */
+const MAX_PARALLEL = 3;
+/** Refresh insights infrequently so they never block live transcript. */
+const INSIGHTS_EVERY_SEGMENTS = 6;
 
 type WakeLockSentinelLike = {
   release: () => Promise<void>;
   addEventListener?: (type: string, listener: () => void) => void;
 };
+
+type QueueItem = { id: number; base64: string };
 
 export function useMeetingRecorder(
   initialApiKey: string
@@ -58,7 +60,6 @@ export function useMeetingRecorder(
   const [apiKey, setApiKeyState] = useState(initialApiKey);
   const [apiKeyValid, setApiKeyValid] = useState<boolean | null>(null);
   const [sourceMode, setSourceMode] = useState<AudioSourceMode>('mic');
-  const [chunkSeconds, setChunkSecondsState] = useState<ChunkSeconds>(2);
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [status, setStatus] = useState<RecordingStatus>({
@@ -74,21 +75,22 @@ export function useMeetingRecorder(
 
   const pcmRecorderRef = useRef<PcmRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const intervalRef = useRef<number | null>(null);
-  const firstFlushRef = useRef<number | null>(null);
   const timerRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const transcriptRef = useRef('');
   const stoppingRef = useRef(false);
   const isRecordingRef = useRef(false);
-  const queueRef = useRef<string[]>([]);
-  const processingQueueRef = useRef(false);
+  const queueRef = useRef<QueueItem[]>([]);
+  const inFlightRef = useRef(0);
+  const nextIdRef = useRef(0);
+  const nextAppendIdRef = useRef(0);
+  const pendingTextRef = useRef<Map<number, string>>(new Map());
   const rateLimitedUntilRef = useRef(0);
   const apiKeyRef = useRef(apiKey);
-  const chunkSecondsRef = useRef<ChunkSeconds>(2);
-  const chunksSinceInsightsRef = useRef(0);
+  const segmentsSinceInsightsRef = useRef(0);
   const insightsBusyRef = useRef(false);
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
+  const pumpRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     transcriptRef.current = transcript;
@@ -124,7 +126,7 @@ export function useMeetingRecorder(
         if (wakeLockRef.current === lock) wakeLockRef.current = null;
       });
     } catch {
-      /* unsupported or denied */
+      /* unsupported */
     }
   }, []);
 
@@ -179,7 +181,7 @@ export function useMeetingRecorder(
   const refreshInsights = useCallback(async () => {
     if (insightsBusyRef.current || stoppingRef.current) return;
     const text = transcriptRef.current.trim();
-    if (text.length < 40) return;
+    if (text.length < 50) return;
     insightsBusyRef.current = true;
     try {
       const res = await extractLiveInsights(apiKeyRef.current, text);
@@ -193,116 +195,104 @@ export function useMeetingRecorder(
     }
   }, []);
 
-  const transcribeBase64 = useCallback(
-    async (base64: string) => {
-      const result = await transcribeAudioChunk(
-        apiKeyRef.current,
-        base64,
-        'audio/wav'
-      );
-      if (result.isRealSpeech && result.transcript) {
-        setTranscript((prev) => {
-          const next = prev
-            ? `${prev} ${result.transcript}`
-            : result.transcript;
-          transcriptRef.current = next;
-          return next;
-        });
-        chunksSinceInsightsRef.current += 1;
-        if (chunksSinceInsightsRef.current >= INSIGHTS_EVERY_CHUNKS) {
-          chunksSinceInsightsRef.current = 0;
-          void refreshInsights();
-        }
+  const flushPendingInOrder = useCallback(() => {
+    while (pendingTextRef.current.has(nextAppendIdRef.current)) {
+      const piece = pendingTextRef.current.get(nextAppendIdRef.current) || '';
+      pendingTextRef.current.delete(nextAppendIdRef.current);
+      nextAppendIdRef.current += 1;
+      if (!piece) continue;
+      setTranscript((prev) => {
+        const next = prev ? `${prev} ${piece}` : piece;
+        transcriptRef.current = next;
+        return next;
+      });
+      segmentsSinceInsightsRef.current += 1;
+      if (segmentsSinceInsightsRef.current >= INSIGHTS_EVERY_SEGMENTS) {
+        segmentsSinceInsightsRef.current = 0;
+        void refreshInsights();
       }
-    },
-    [refreshInsights]
-  );
+    }
+  }, [refreshInsights]);
 
-  const processQueue = useCallback(async () => {
-    if (processingQueueRef.current) return;
-    processingQueueRef.current = true;
-    setIsProcessing(true);
+  const pumpQueue = useCallback(() => {
+    const now = Date.now();
+    if (now < rateLimitedUntilRef.current) {
+      const waitSec = Math.ceil((rateLimitedUntilRef.current - now) / 1000);
+      if (!stoppingRef.current) {
+        setStatus({
+          status: 'recording',
+          message: `ממתין לאיפוס מכסה (${waitSec}ש)…`,
+        });
+      }
+      return;
+    }
 
-    try {
-      while (queueRef.current.length > 0) {
-        const now = Date.now();
-        if (now < rateLimitedUntilRef.current) {
-          const waitSec = Math.ceil(
-            (rateLimitedUntilRef.current - now) / 1000
-          );
-          setStatus({
-            status: 'recording',
-            message: `ממתין לאיפוס מכסה (${waitSec}ש)…`,
-          });
-          break;
-        }
+    while (
+      inFlightRef.current < MAX_PARALLEL &&
+      queueRef.current.length > 0 &&
+      Date.now() >= rateLimitedUntilRef.current
+    ) {
+      const item = queueRef.current.shift();
+      if (!item) break;
 
-        const base64 = queueRef.current.shift();
-        if (!base64) break;
+      inFlightRef.current += 1;
+      setIsProcessing(true);
+      if (!stoppingRef.current) {
+        setStatus({ status: 'recording', message: 'מקליט · מתמלל ברקע' });
+      }
 
-        if (!stoppingRef.current) {
-          setStatus({ status: 'processing', message: 'מתמלל…' });
-        }
-
+      void (async () => {
         try {
-          await transcribeBase64(base64);
-          if (!stoppingRef.current) {
-            setStatus({ status: 'recording', message: 'מקליט' });
-          }
+          const result = await transcribeAudioChunk(
+            apiKeyRef.current,
+            item.base64,
+            'audio/wav'
+          );
+          const text =
+            result.isRealSpeech && result.transcript
+              ? result.transcript.trim()
+              : '';
+          pendingTextRef.current.set(item.id, text);
+          flushPendingInOrder();
         } catch (err) {
           const msg = err instanceof Error ? err.message : 'שגיאה לא ידועה';
           if (msg.includes('429')) {
             rateLimitedUntilRef.current = Date.now() + RATE_LIMIT_RETRY_MS;
-            queueRef.current.unshift(base64);
-            setStatus({
-              status: 'recording',
-              message: 'הגעת למכסה הרגעית. ממתין 30 שניות וממשיך…',
-            });
-            break;
+            queueRef.current.unshift(item);
+            if (!stoppingRef.current) {
+              setStatus({
+                status: 'recording',
+                message: 'הגעת למכסה הרגעית. ממתין 30 שניות וממשיך…',
+              });
+            }
+          } else if (!stoppingRef.current) {
+            setStatus({ status: 'error', message: msg });
           }
-          setStatus({ status: 'error', message: msg });
+          pendingTextRef.current.set(item.id, '');
+          flushPendingInOrder();
+        } finally {
+          inFlightRef.current -= 1;
+          if (inFlightRef.current === 0 && queueRef.current.length === 0) {
+            setIsProcessing(false);
+            if (!stoppingRef.current && isRecordingRef.current) {
+              setStatus({ status: 'recording', message: 'מקליט' });
+            }
+          }
+          pumpRef.current();
         }
-      }
-    } finally {
-      processingQueueRef.current = false;
-      if (queueRef.current.length === 0) {
-        setIsProcessing(false);
-      } else if (Date.now() >= rateLimitedUntilRef.current) {
-        void processQueue();
-      }
+      })();
     }
-  }, [transcribeBase64]);
+  }, [flushPendingInOrder]);
 
-  const enqueueCurrentAudio = useCallback(() => {
-    const recorder = pcmRecorderRef.current;
-    if (!recorder || !recorder.hasAudio()) return;
-    const base64 = recorder.takeWavBase64();
-    if (!base64) return;
-    queueRef.current.push(base64);
-    void processQueue();
-  }, [processQueue]);
+  useEffect(() => {
+    pumpRef.current = pumpQueue;
+  }, [pumpQueue]);
 
-  const startChunkLoop = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-    const ms = chunkSecondsRef.current * 1000;
-    intervalRef.current = window.setInterval(() => {
-      enqueueCurrentAudio();
-    }, ms);
-  }, [enqueueCurrentAudio]);
-
-  const setChunkSeconds = useCallback(
-    (s: ChunkSeconds) => {
-      setChunkSecondsState(s);
-      chunkSecondsRef.current = s;
-      if (isRecordingRef.current) {
-        startChunkLoop();
-      }
-    },
-    [startChunkLoop]
-  );
+  const enqueueSegment = useCallback((base64: string) => {
+    const id = nextIdRef.current++;
+    queueRef.current.push({ id, base64 });
+    pumpRef.current();
+  }, []);
 
   const start = useCallback(async () => {
     if (!apiKeyRef.current.trim()) {
@@ -313,7 +303,9 @@ export function useMeetingRecorder(
       const stream = await getAudioStream(sourceMode);
       streamRef.current = stream;
 
-      const recorder = new PcmRecorder(stream);
+      const recorder = new PcmRecorder(stream, (base64) => {
+        enqueueSegment(base64);
+      });
       pcmRecorderRef.current = recorder;
 
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -322,7 +314,11 @@ export function useMeetingRecorder(
       stoppingRef.current = false;
       rateLimitedUntilRef.current = 0;
       queueRef.current = [];
-      chunksSinceInsightsRef.current = 0;
+      pendingTextRef.current.clear();
+      nextIdRef.current = 0;
+      nextAppendIdRef.current = 0;
+      inFlightRef.current = 0;
+      segmentsSinceInsightsRef.current = 0;
 
       setSummary('');
       setTasks([]);
@@ -338,14 +334,6 @@ export function useMeetingRecorder(
       timerRef.current = window.setInterval(() => {
         setElapsedSeconds((s) => s + 1);
       }, 1000);
-
-      const firstMs = Math.min(1500, chunkSecondsRef.current * 1000);
-      firstFlushRef.current = window.setTimeout(() => {
-        enqueueCurrentAudio();
-        firstFlushRef.current = null;
-      }, firstMs);
-
-      startChunkLoop();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'שגיאה בהפעלת ההקלטה';
       setStatus({ status: 'error', message: msg });
@@ -353,24 +341,9 @@ export function useMeetingRecorder(
       setIsRecording(false);
       await releaseWakeLock();
     }
-  }, [
-    sourceMode,
-    updateAudioLevel,
-    enqueueCurrentAudio,
-    startChunkLoop,
-    requestWakeLock,
-    releaseWakeLock,
-  ]);
+  }, [sourceMode, updateAudioLevel, enqueueSegment, requestWakeLock, releaseWakeLock]);
 
   const teardownCapture = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-    if (firstFlushRef.current) {
-      clearTimeout(firstFlushRef.current);
-      firstFlushRef.current = null;
-    }
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
@@ -382,6 +355,18 @@ export function useMeetingRecorder(
     setAudioLevel(0);
     isRecordingRef.current = false;
     setIsRecording(false);
+  }, []);
+
+  const waitForQueueDrain = useCallback(async () => {
+    let guard = 0;
+    while (
+      (queueRef.current.length > 0 || inFlightRef.current > 0) &&
+      guard < 300
+    ) {
+      pumpRef.current();
+      await new Promise((r) => setTimeout(r, 100));
+      guard += 1;
+    }
   }, []);
 
   const stop = useCallback(() => {
@@ -409,18 +394,9 @@ export function useMeetingRecorder(
     (async () => {
       try {
         if (leftover) {
-          queueRef.current.push(leftover);
+          enqueueSegment(leftover);
         }
-        await processQueue();
-        let guard = 0;
-        while (
-          (queueRef.current.length > 0 || processingQueueRef.current) &&
-          guard < 200
-        ) {
-          await new Promise((r) => setTimeout(r, 100));
-          await processQueue();
-          guard += 1;
-        }
+        await waitForQueueDrain();
 
         setInsights([]);
 
@@ -441,7 +417,7 @@ export function useMeetingRecorder(
         stoppingRef.current = false;
       }
     })();
-  }, [teardownCapture, releaseWakeLock, processQueue]);
+  }, [teardownCapture, releaseWakeLock, enqueueSegment, waitForQueueDrain]);
 
   const reset = useCallback(() => {
     if (isRecording) stop();
@@ -452,6 +428,7 @@ export function useMeetingRecorder(
     setElapsedSeconds(0);
     transcriptRef.current = '';
     queueRef.current = [];
+    pendingTextRef.current.clear();
     setStatus({ status: 'idle', message: 'מוכן להתחלה' });
   }, [isRecording, stop]);
 
@@ -543,8 +520,6 @@ export function useMeetingRecorder(
 
   useEffect(() => {
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      if (firstFlushRef.current) clearTimeout(firstFlushRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       if (pcmRecorderRef.current) pcmRecorderRef.current.stop();
@@ -561,8 +536,6 @@ export function useMeetingRecorder(
     apiKeyValid,
     sourceMode,
     setSourceMode,
-    chunkSeconds,
-    setChunkSeconds,
     isRecording,
     isProcessing,
     status,

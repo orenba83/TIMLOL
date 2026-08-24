@@ -1,7 +1,5 @@
 export type AudioSourceMode = 'mic' | 'system' | 'both';
 
-export type ChunkSeconds = 1 | 2 | 3;
-
 export interface TaskItem {
   task: string;
   assignee: string;
