@@ -2,16 +2,14 @@ import type { AudioSourceMode } from './types';
 
 export const FILE_CHUNK_SECONDS = 20;
 
-/** After this much silence following speech → send segment (live feel). */
-const SILENCE_FLUSH_MS = 380;
-/** Never hold continuous speech longer than this before sending. */
-const MAX_UTTERANCE_MS = 2000;
-/** Ignore tiny blips. */
-const MIN_SPEECH_MS = 280;
-const MAX_BUFFER_SECONDS = 10;
-const MIN_SAMPLES_SEC = 0.2;
-/** Absolute RMS floor for speech (also compared to noise floor). */
-const SPEECH_RMS = 0.012;
+/** Pause after speech before sending (balance live vs rate limits). */
+const SILENCE_FLUSH_MS = 550;
+/** Force send long continuous speech. */
+const MAX_UTTERANCE_MS = 3500;
+const MIN_SPEECH_MS = 400;
+const MAX_BUFFER_SECONDS = 12;
+const MIN_SAMPLES_SEC = 0.25;
+const SPEECH_RMS = 0.015;
 
 export function isDisplayMediaSupported(): boolean {
   try {
@@ -211,11 +209,6 @@ function rmsOf(input: Float32Array): number {
 
 export type SegmentHandler = (base64Wav: string) => void;
 
-/**
- * Continuous PCM capture with automatic segmenting:
- * flush after a short pause in speech, or after max utterance length.
- * No manual delay slider — segments follow natural speech rhythm.
- */
 export class PcmRecorder {
   private audioContext: AudioContext;
   private source: MediaStreamAudioSourceNode;

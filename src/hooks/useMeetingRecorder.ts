@@ -41,11 +41,11 @@ interface UseMeetingRecorderResult {
   copyInsights: () => void;
 }
 
-const RATE_LIMIT_RETRY_MS = 30000;
-/** Parallel Gemini transcription workers — keeps text flowing while API responds. */
-const MAX_PARALLEL = 3;
-/** Refresh insights infrequently so they never block live transcript. */
-const INSIGHTS_EVERY_SEGMENTS = 6;
+const RATE_LIMIT_RETRY_MS = 45000;
+/** One request at a time avoids free-tier 429 storms. */
+const MAX_PARALLEL = 1;
+const MAX_QUEUE = 4;
+const INSIGHTS_EVERY_SEGMENTS = 8;
 
 type WakeLockSentinelLike = {
   release: () => Promise<void>;
@@ -76,6 +76,7 @@ export function useMeetingRecorder(
   const pcmRecorderRef = useRef<PcmRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const timerRef = useRef<number | null>(null);
+  const rateRetryRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const transcriptRef = useRef('');
   const stoppingRef = useRef(false);
@@ -180,6 +181,7 @@ export function useMeetingRecorder(
 
   const refreshInsights = useCallback(async () => {
     if (insightsBusyRef.current || stoppingRef.current) return;
+    if (Date.now() < rateLimitedUntilRef.current) return;
     const text = transcriptRef.current.trim();
     if (text.length < 50) return;
     insightsBusyRef.current = true;
@@ -214,6 +216,22 @@ export function useMeetingRecorder(
     }
   }, [refreshInsights]);
 
+  const scheduleRateLimitRetry = useCallback(() => {
+    if (rateRetryRef.current) {
+      clearTimeout(rateRetryRef.current);
+      rateRetryRef.current = null;
+    }
+    const wait = Math.max(0, rateLimitedUntilRef.current - Date.now()) + 50;
+    rateRetryRef.current = window.setTimeout(() => {
+      rateRetryRef.current = null;
+      rateLimitedUntilRef.current = 0;
+      if (!stoppingRef.current && isRecordingRef.current) {
+        setStatus({ status: 'recording', message: 'מקליט · ממשיך תמלול' });
+      }
+      pumpRef.current();
+    }, wait);
+  }, []);
+
   const pumpQueue = useCallback(() => {
     const now = Date.now();
     if (now < rateLimitedUntilRef.current) {
@@ -221,9 +239,10 @@ export function useMeetingRecorder(
       if (!stoppingRef.current) {
         setStatus({
           status: 'recording',
-          message: `ממתין לאיפוס מכסה (${waitSec}ש)…`,
+          message: `מכסת API מלאה — ממשיך אוטומטית בעוד ${waitSec}ש (ההקלטה נמשכת)`,
         });
       }
+      scheduleRateLimitRetry();
       return;
     }
 
@@ -238,7 +257,7 @@ export function useMeetingRecorder(
       inFlightRef.current += 1;
       setIsProcessing(true);
       if (!stoppingRef.current) {
-        setStatus({ status: 'recording', message: 'מקליט · מתמלל ברקע' });
+        setStatus({ status: 'recording', message: 'מקליט · מתמלל' });
       }
 
       void (async () => {
@@ -256,33 +275,47 @@ export function useMeetingRecorder(
           flushPendingInOrder();
         } catch (err) {
           const msg = err instanceof Error ? err.message : 'שגיאה לא ידועה';
-          if (msg.includes('429')) {
+          if (msg.includes('429') || msg.includes('Resource exhausted')) {
             rateLimitedUntilRef.current = Date.now() + RATE_LIMIT_RETRY_MS;
             queueRef.current.unshift(item);
+            if (queueRef.current.length > MAX_QUEUE) {
+              queueRef.current = queueRef.current.slice(0, MAX_QUEUE);
+            }
             if (!stoppingRef.current) {
               setStatus({
                 status: 'recording',
-                message: 'הגעת למכסה הרגעית. ממתין 30 שניות וממשיך…',
+                message:
+                  'מכסת Gemini מלאה — ממשיך אוטומטית בעוד כ־45ש (ההקלטה נמשכת)',
               });
             }
-          } else if (!stoppingRef.current) {
-            setStatus({ status: 'error', message: msg });
+            scheduleRateLimitRetry();
+            // Do NOT mark pending empty — keeps order and retries same item
+          } else {
+            if (!stoppingRef.current) {
+              setStatus({ status: 'error', message: msg });
+            }
+            pendingTextRef.current.set(item.id, '');
+            flushPendingInOrder();
           }
-          pendingTextRef.current.set(item.id, '');
-          flushPendingInOrder();
         } finally {
           inFlightRef.current -= 1;
           if (inFlightRef.current === 0 && queueRef.current.length === 0) {
             setIsProcessing(false);
-            if (!stoppingRef.current && isRecordingRef.current) {
+            if (
+              !stoppingRef.current &&
+              isRecordingRef.current &&
+              Date.now() >= rateLimitedUntilRef.current
+            ) {
               setStatus({ status: 'recording', message: 'מקליט' });
             }
           }
-          pumpRef.current();
+          if (Date.now() >= rateLimitedUntilRef.current) {
+            pumpRef.current();
+          }
         }
       })();
     }
-  }, [flushPendingInOrder]);
+  }, [flushPendingInOrder, scheduleRateLimitRetry]);
 
   useEffect(() => {
     pumpRef.current = pumpQueue;
@@ -291,8 +324,15 @@ export function useMeetingRecorder(
   const enqueueSegment = useCallback((base64: string) => {
     const id = nextIdRef.current++;
     queueRef.current.push({ id, base64 });
+    while (queueRef.current.length > MAX_QUEUE) {
+      const dropped = queueRef.current.shift();
+      if (dropped) {
+        pendingTextRef.current.set(dropped.id, '');
+        flushPendingInOrder();
+      }
+    }
     pumpRef.current();
-  }, []);
+  }, [flushPendingInOrder]);
 
   const start = useCallback(async () => {
     if (!apiKeyRef.current.trim()) {
@@ -313,6 +353,10 @@ export function useMeetingRecorder(
 
       stoppingRef.current = false;
       rateLimitedUntilRef.current = 0;
+      if (rateRetryRef.current) {
+        clearTimeout(rateRetryRef.current);
+        rateRetryRef.current = null;
+      }
       queueRef.current = [];
       pendingTextRef.current.clear();
       nextIdRef.current = 0;
@@ -361,10 +405,10 @@ export function useMeetingRecorder(
     let guard = 0;
     while (
       (queueRef.current.length > 0 || inFlightRef.current > 0) &&
-      guard < 300
+      guard < 400
     ) {
       pumpRef.current();
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 150));
       guard += 1;
     }
   }, []);
@@ -521,6 +565,7 @@ export function useMeetingRecorder(
   useEffect(() => {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
+      if (rateRetryRef.current) clearTimeout(rateRetryRef.current);
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       if (pcmRecorderRef.current) pcmRecorderRef.current.stop();
       if (streamRef.current) {
