@@ -256,9 +256,14 @@ export class PcmRecorder {
 
       const rms = rmsOf(frame);
       const frameMs = (frame.length / this.sampleRate) * 1000;
-      this.noiseFloor = this.noiseFloor * 0.97 + rms * 0.03;
       const threshold = Math.max(SPEECH_RMS, this.noiseFloor * 2.8);
       const isSpeech = rms >= threshold;
+      // Only track ambient noise during silence, otherwise sustained loud
+      // speech drags the floor up and the threshold ends up chasing the
+      // speaker, causing quieter follow-up speech to be missed.
+      if (!isSpeech) {
+        this.noiseFloor = this.noiseFloor * 0.97 + rms * 0.03;
+      }
 
       if (isSpeech) {
         this.inSpeech = true;

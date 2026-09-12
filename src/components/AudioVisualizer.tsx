@@ -31,7 +31,6 @@ export function AudioVisualizer({ isRecording, audioLevel }: AudioVisualizerProp
       const time = Date.now() / 1000;
 
       for (let i = 0; i < bars; i++) {
-        const t = i / bars;
         const wave =
           (Math.sin(time * 3 + i * 0.4) * 0.5 +
             Math.sin(time * 5 + i * 0.7) * 0.3 +
