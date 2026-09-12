@@ -132,24 +132,34 @@ async function callGemini(
 
   let lastError: unknown = null;
   for (const model of models) {
-    try {
-      const candidate = await callGeminiOnce(
-        apiKey,
-        model,
-        systemPrompt,
-        parts,
-        maxOutputTokens
-      );
-      resolvedModel = model;
-      return candidate;
-    } catch (err) {
-      lastError = err;
-      const status = (err as { status?: number }).status;
-      if (status === 404 || status === 400) {
-        continue;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const candidate = await callGeminiOnce(
+          apiKey,
+          model,
+          systemPrompt,
+          parts,
+          maxOutputTokens
+        );
+        resolvedModel = model;
+        return candidate;
+      } catch (err) {
+        lastError = err;
+        const status = (err as { status?: number }).status;
+        // Transient server-side errors: retry the same model once before
+        // moving on, instead of dropping this chunk's transcript for good.
+        if (attempt === 0 && status !== undefined && status >= 500) {
+          await new Promise((r) => setTimeout(r, 800));
+          continue;
+        }
+        break;
       }
-      throw err;
     }
+    const status = (lastError as { status?: number })?.status;
+    if (status === 404 || status === 400) {
+      continue;
+    }
+    throw lastError;
   }
   throw lastError instanceof Error
     ? lastError

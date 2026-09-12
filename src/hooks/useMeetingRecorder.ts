@@ -339,6 +339,7 @@ export function useMeetingRecorder(
       setStatus({ status: 'error', message: 'נא להזין מפתח API תחילה' });
       return;
     }
+    if (isRecordingRef.current) return;
     try {
       const stream = await getAudioStream(sourceMode);
       streamRef.current = stream;
@@ -383,6 +384,22 @@ export function useMeetingRecorder(
       setStatus({ status: 'error', message: msg });
       isRecordingRef.current = false;
       setIsRecording(false);
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      if (pcmRecorderRef.current) {
+        pcmRecorderRef.current.stop();
+        pcmRecorderRef.current = null;
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        const mixCtx = (
+          streamRef.current as MediaStream & { _mixContext?: AudioContext }
+        )._mixContext;
+        mixCtx?.close().catch(() => {});
+        streamRef.current = null;
+      }
       await releaseWakeLock();
     }
   }, [sourceMode, updateAudioLevel, enqueueSegment, requestWakeLock, releaseWakeLock]);
